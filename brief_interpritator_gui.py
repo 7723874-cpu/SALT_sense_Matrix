@@ -14,6 +14,7 @@ import os
 import re
 import json
 import datetime as dt
+from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -32,6 +33,65 @@ try:
     import openai as openai_legacy  # legacy SDK
 except Exception:
     openai_legacy = None
+
+
+# -----------------------------
+# API key persistence
+# -----------------------------
+ENV_KEY_PRIORITY = ["OPENAI_API_KEY"]
+
+
+def _mask_key(key: str) -> str:
+    key = (key or "").strip()
+    if not key:
+        return "****"
+    tail = key[-4:] if len(key) >= 4 else key
+    return f"****{tail}"
+
+
+def _env_file_path() -> Path:
+    if os.name == "nt":
+        base = os.environ.get("APPDATA")
+        if base:
+            return Path(base) / "SALT" / "brief_interpretator" / ".env"
+        return Path.home() / "AppData" / "Roaming" / "SALT" / "brief_interpretator" / ".env"
+    if hasattr(os, "uname") and os.uname().sysname == "Darwin":
+        return Path.home() / "Library" / "Application Support" / "SALT" / "brief_interpretator" / ".env"
+    return Path.home() / ".config" / "salt" / "brief_interpretator" / ".env"
+
+
+def load_api_key() -> str | None:
+    for key_name in ENV_KEY_PRIORITY:
+        val = os.environ.get(key_name)
+        if val and val.strip():
+            return val.strip()
+
+    env_path = _env_file_path()
+    if not env_path.exists():
+        return None
+
+    try:
+        content = env_path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    match = re.search(r"^\s*OPENAI_API_KEY\s*=\s*(.+)\s*$", content, flags=re.MULTILINE)
+    if not match:
+        return None
+    key = match.group(1).strip()
+    if key:
+        os.environ["OPENAI_API_KEY"] = key
+    return key or None
+
+
+def save_api_key(key: str):
+    key = (key or "").strip()
+    if not key:
+        return
+    os.environ["OPENAI_API_KEY"] = key
+    env_path = _env_file_path()
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text(f"OPENAI_API_KEY={key}\n", encoding="utf-8")
 
 
 # -----------------------------
@@ -638,6 +698,7 @@ class BriefInterpretatorGUI(tk.Tk):
         self.generated_json = None
 
         self._build_ui()
+        self._load_saved_key()
 
     def _build_ui(self):
         pad = {"padx": 10, "pady": 8}
@@ -651,15 +712,17 @@ class BriefInterpretatorGUI(tk.Tk):
 
         ttk.Label(box, text="OpenAI API key:").grid(row=1, column=0, sticky="w", padx=8, pady=6)
         ttk.Entry(box, textvariable=self.api_key, width=70, show="•").grid(row=1, column=1, sticky="w", padx=8, pady=6)
+        self.btn_save_key = ttk.Button(box, text="Save key", command=self.save_key)
+        self.btn_save_key.grid(row=1, column=2, padx=6, pady=6)
 
-        ttk.Label(box, text="Model:").grid(row=1, column=2, sticky="e", padx=8, pady=6)
+        ttk.Label(box, text="Model:").grid(row=1, column=3, sticky="e", padx=8, pady=6)
         ttk.Combobox(
             box,
             textvariable=self.model,
             state="readonly",
             width=18,
             values=["gpt-5.2", "gpt-5-mini", "gpt-4.1", "gpt-4o", "gpt-4o-mini"],
-        ).grid(row=1, column=3, sticky="w", padx=8, pady=6)
+        ).grid(row=1, column=4, sticky="w", padx=8, pady=6)
 
         ttk.Label(box, text="Tone (RU):").grid(row=2, column=0, sticky="w", padx=8, pady=6)
         ttk.Entry(box, textvariable=self.tone, width=92).grid(row=2, column=1, columnspan=3, sticky="we", padx=8, pady=6)
@@ -670,7 +733,8 @@ class BriefInterpretatorGUI(tk.Tk):
         act.pack(fill="x", **pad)
 
         ttk.Button(act, text="Preview input", command=self.preview_input).pack(side="left", padx=8)
-        ttk.Button(act, text="Generate BICM (JSON)", command=self.generate).pack(side="left", padx=8)
+        self.btn_generate = ttk.Button(act, text="Generate BICM (JSON)", command=self.generate)
+        self.btn_generate.pack(side="left", padx=8)
         ttk.Button(act, text="Export Word (BICM)", command=self.save_word).pack(side="left", padx=8)
 
         self.status = ttk.Label(act, text="Ready.")
@@ -703,17 +767,45 @@ class BriefInterpretatorGUI(tk.Tk):
         self.txt_log.see("end")
         self.txt_log.config(state="normal")
 
+    def _load_saved_key(self):
+        key = load_api_key()
+        if key:
+            self.api_key.set(key)
+            self.log(f"[KEY] loaded: {_mask_key(key)}")
+
+    def save_key(self):
+        key = self.api_key.get().strip()
+        if not key:
+            messagebox.showinfo("No API key", "API key is missing. Please paste and save the key.")
+            self.log("[WARN] API key is missing. Please paste and save the key.")
+            return
+        try:
+            save_api_key(key)
+            self.log(f"[KEY] saved: {_mask_key(key)}")
+            self.status.config(text="API key saved.")
+        except Exception as e:
+            messagebox.showerror("Save error", str(e))
+            self.log(f"[ERROR] save_key: {e}")
+
     def pick_file(self):
         path = filedialog.askopenfilename(
             title="Choose SAFE brief",
             filetypes=[
-                ("Word document", "*.docx"),
-                ("Excel workbook", "*.xlsx"),
-                ("Text file", "*.txt"),
                 ("All files", "*.*"),
+                ("Word documents", "*.docx;*.doc"),
+                ("Excel files", "*.xlsx;*.xls"),
+                ("Text files", "*.txt"),
             ],
         )
         if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in (".docx", ".xlsx", ".txt"):
+            messagebox.showinfo(
+                "Unsupported file",
+                "Unsupported file type. Please select .docx, .xlsx or .txt",
+            )
+            self.log(f"[WARN] Unsupported file type selected: {path}")
             return
         self.input_path.set(path)
         self.status.config(text="File selected.")
@@ -745,7 +837,8 @@ class BriefInterpretatorGUI(tk.Tk):
             messagebox.showinfo("No file", "Choose a SAFE brief file first.")
             return
         if not self.api_key.get().strip():
-            messagebox.showinfo("No API key", "Paste your OpenAI API key.")
+            messagebox.showinfo("No API key", "API key is missing. Please paste and save the key.")
+            self.log("[WARN] API key is missing. Please paste and save the key.")
             return
 
         if self.payload is None:
@@ -755,7 +848,8 @@ class BriefInterpretatorGUI(tk.Tk):
                 messagebox.showerror("Error", str(e))
                 return
 
-        self.status.config(text="Generating…")
+        self.status.config(text="Processing...")
+        self.btn_generate.config(state="disabled")
         self.update_idletasks()
         self._set_text(self.txt_log, "")
 
@@ -778,11 +872,15 @@ class BriefInterpretatorGUI(tk.Tk):
             self.generated_json = doc_json
             self._set_text(self.txt_json, json.dumps(doc_json, ensure_ascii=False, indent=2))
             self.log("[OK] Generated JSON.")
+            self.log("[DONE] Interpretation generated")
+            messagebox.showinfo("Ready", "Interpretation is ready.")
             self.status.config(text="Generated.")
         except Exception as e:
             messagebox.showerror("Generation error", str(e))
             self.log(f"[ERROR] generate: {e}")
             self.status.config(text="Error.")
+        finally:
+            self.btn_generate.config(state="normal")
 
     def save_word(self, notify: bool = True):
         if not self.generated_json:
@@ -798,10 +896,10 @@ class BriefInterpretatorGUI(tk.Tk):
                 return
             self.log("[BICM] building Word document")
             render_docx(out_path, self.generated_json, self.generated_json.get("meta", {}))
-            self.log(f"[BICM] export completed: {out_path}")
+            self.log(f"[DONE] Word exported: {out_path}")
             self.status.config(text="Exported.")
             if notify:
-                messagebox.showinfo("Exported", out_path)
+                messagebox.showinfo("Ready", "Word report saved successfully.")
         except Exception as e:
             messagebox.showerror("Save error", str(e))
             self.log(f"[ERROR] save_word: {e}")
