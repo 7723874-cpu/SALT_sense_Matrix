@@ -17,7 +17,10 @@ import datetime as dt
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from docx import Document
+try:
+    from docx import Document
+except Exception:
+    Document = None
 from openpyxl import load_workbook
 
 try:
@@ -182,13 +185,27 @@ BICM_LAYERS = [
 STATUS_TO_EMOJI = {
     "filled": "🟢 Filled",
     "partial": "🟡 Partial",
-    "missing": "🔴 Missing",
+    "empty": "🔴 Empty",
 }
 
 MATURITY_TO_LABEL = {
     "draft": "🟥 Draft",
-    "workable": "🟨 Workable with risks",
-    "ready": "🟩 Contract-ready",
+    "medium": "🟨 Medium",
+    "mature": "🟩 Mature",
+}
+
+RU_LAYER_PATHS = {
+    "BUSINESS_GOAL": "Цели/Бизнес-цель",
+    "RESEARCH_GOAL": "Цели/Исследовательская цель",
+    "DECISION_CONTEXT": "Контекст/Решение и зачем",
+    "SCOPE_AND_BOUNDARIES": "Объём/Границы и рамки",
+    "TARGET_AUDIENCE": "Аудитория/ЦА",
+    "GEOGRAPHY": "География/Регионы",
+    "KEY_QUESTIONS": "Вопросы/Ключевые вопросы",
+    "EXPECTED_OUTPUT": "Результаты/Ожидаемые материалы",
+    "SUCCESS_CRITERIA": "Критерии/Успех",
+    "CONSTRAINTS": "Ограничения/Сроки, бюджет, орг. ограничения",
+    "RISKS_AND_ASSUMPTIONS": "Риски/Допущения",
 }
 
 
@@ -198,7 +215,7 @@ def make_bicm_template() -> dict:
         "layers": [
             {
                 "layer": layer,
-                "status": "missing",
+                "status": "empty",
                 "what_is_stated": [],
                 "gaps": [],
                 "note": "",
@@ -212,13 +229,15 @@ def make_bicm_template() -> dict:
 
 def _normalize_status(val: str) -> str:
     v = (val or "").strip().lower()
-    if v in ("filled", "partial", "missing"):
+    if v in ("filled", "partial", "empty"):
         return v
     if v in ("full", "complete"):
         return "filled"
     if v in ("partly", "partial_fill"):
         return "partial"
-    return "missing"
+    if v in ("missing", "none"):
+        return "empty"
+    return "empty"
 
 
 def _ensure_bicm(obj: dict, meta: dict) -> dict:
@@ -266,7 +285,7 @@ def _ensure_bicm(obj: dict, meta: dict) -> dict:
         what_is_stated = [str(x).strip() for x in what_is_stated if str(x).strip()]
         gaps = [str(x).strip() for x in gaps if str(x).strip()]
 
-        if status == "missing":
+        if status == "empty":
             what_is_stated = []
 
         out["layers"].append(
@@ -293,7 +312,12 @@ def _ensure_bicm(obj: dict, meta: dict) -> dict:
     if isinstance(maturity_in, dict):
         level = (maturity_in.get("level") or "").strip().lower()
         if level not in MATURITY_TO_LABEL:
-            level = "draft"
+            if level == "workable":
+                level = "medium"
+            elif level == "ready":
+                level = "mature"
+            else:
+                level = "draft"
         out["maturity"]["level"] = level
         out["maturity"]["rationale"] = str(maturity_in.get("rationale", "") or "").strip()
 
@@ -327,8 +351,8 @@ def build_instruction(tone: str) -> str:
         "2) Используй короткие деловые буллеты на русском языке.\n"
         "3) Никаких брендов, доменных имён, имён людей, точных адресов.\n"
         "   Если встречается — замени токенами BRAND_#, DOMAIN_#, PERSON_#, GEO_#.\n"
-        "4) Статусы только: filled / partial / missing.\n"
-        "5) Если данных по слою нет — status=missing и what_is_stated пустой.\n"
+        "4) Статусы только: filled / partial / empty.\n"
+        "5) Если данных по слою нет — status=empty и what_is_stated пустой.\n"
         "6) Слои строго в таком порядке:\n"
         f"{layers_text}\n"
         "7) Тон: " + (tone or "деловой, чёткий, без лишних слов") + "\n"
@@ -429,59 +453,106 @@ def add_bullets(doc: Document, items: list[str]):
 
 
 def _status_label(status: str) -> str:
-    return STATUS_TO_EMOJI.get(status, "🔴 Missing")
+    return STATUS_TO_EMOJI.get(status, "🔴 Empty")
 
 
 def _maturity_label(level: str) -> str:
     return MATURITY_TO_LABEL.get(level, "🟥 Draft")
 
 
+def _ru_layer_path(layer_name: str) -> str:
+    return RU_LAYER_PATHS.get((layer_name or "").strip().upper(), (layer_name or "").strip())
+
+
+def _meaningful_points(items: list[str]) -> int:
+    count = 0
+    for it in items or []:
+        text = str(it or "").strip()
+        if not text:
+            continue
+        if len(re.sub(r"\W+", "", text)) < 3:
+            continue
+        count += 1
+    return count
+
+
+def _derive_layer_status(layer: dict) -> str:
+    what_is_stated = layer.get("what_is_stated", []) or []
+    gaps = layer.get("gaps", []) or []
+    if isinstance(what_is_stated, str):
+        what_is_stated = [what_is_stated]
+    if isinstance(gaps, str):
+        gaps = [gaps]
+    count = _meaningful_points(what_is_stated)
+    if count == 0:
+        return "empty"
+    if count >= 2 and not gaps:
+        return "filled"
+    return "partial"
+
+
+def _layer_comment(layer: dict) -> str:
+    note = str(layer.get("note", "") or "").strip()
+    if note:
+        return note.splitlines()[0]
+    gaps = layer.get("gaps", []) or []
+    if gaps:
+        return "Есть пробелы/неясности"
+    return "—"
+
+
 def render_docx(out_path: str, doc_json: dict, meta: dict):
+    if Document is None:
+        raise RuntimeError("нужен python-docx")
     doc = Document()
 
     add_heading(doc, "BICM Interpretation (SAFE)", level=0)
 
     add_heading(doc, "1. Паспорт интерпретации", level=1)
-    add_paragraph(doc, f"Источник: {meta.get('source_file','')}")
-    add_paragraph(doc, f"Тип источника: {meta.get('source_type','Mixed')}")
+    source_file = meta.get("source_file", "")
+    source_type = meta.get("source_type", "")
+    source_suffix = f" ({source_type})" if source_type else ""
+    add_paragraph(doc, f"Источник: {source_file}{source_suffix}")
     add_paragraph(doc, f"Дата генерации: {meta.get('generated_at','')}")
     add_paragraph(doc, "NDA-статус: SAFE")
-    add_paragraph(doc, "Цель интерпретации: приведение к контрактно-читаемому виду для оценки полноты и рисков")
+    add_paragraph(doc, "Цель: приведение к контрактно-читаемому виду для оценки полноты и рисков")
 
     add_heading(doc, "2. Карта контрактных слоёв", level=1)
     table = doc.add_table(rows=1, cols=3)
     hdr_cells = table.rows[0].cells
-    hdr_cells[0].text = "Contract layer"
+    hdr_cells[0].text = "Contract layer (RU path)"
     hdr_cells[1].text = "Status"
     hdr_cells[2].text = "Comment"
 
     for layer in doc_json.get("layers", []):
+        status = _derive_layer_status(layer)
         row_cells = table.add_row().cells
-        row_cells[0].text = layer.get("layer", "")
-        row_cells[1].text = _status_label(layer.get("status", "missing"))
-        row_cells[2].text = layer.get("note", "") or ""
+        row_cells[0].text = _ru_layer_path(layer.get("layer", ""))
+        row_cells[1].text = _status_label(status)
+        row_cells[2].text = _layer_comment(layer)
 
     add_heading(doc, "3. Расшифровка по слоям", level=1)
     for layer in doc_json.get("layers", []):
-        layer_name = layer.get("layer", "")
-        add_heading(doc, f"LAYER: {layer_name}", level=2)
-        add_paragraph(doc, f"Status: {_status_label(layer.get('status', 'missing'))}")
+        layer_name = _ru_layer_path(layer.get("layer", ""))
+        status = _derive_layer_status(layer)
+        add_heading(doc, f"СЛОЙ: {layer_name}", level=2)
+        add_paragraph(doc, f"Статус: {_status_label(status)}")
 
-        add_paragraph(doc, "What is stated:")
+        add_paragraph(doc, "Что сказано:")
         what_is_stated = layer.get("what_is_stated", []) or []
         if what_is_stated:
             add_bullets(doc, what_is_stated)
         else:
             add_paragraph(doc, "—")
 
-        add_paragraph(doc, "Gaps / ambiguity:")
+        add_paragraph(doc, "Пробелы/неясности:")
         gaps = layer.get("gaps", []) or []
         if gaps:
             add_bullets(doc, gaps)
         else:
             add_paragraph(doc, "—")
 
-        add_paragraph(doc, f"Interpreter note: {layer.get('note', '') or '—'}")
+        add_paragraph(doc, f"Примечание интерпретатора: {layer.get('note', '') or '—'}")
 
     add_heading(doc, "4. Risk map", level=1)
     def risk_block(label: str, items: list[str]):
@@ -498,8 +569,8 @@ def render_docx(out_path: str, doc_json: dict, meta: dict):
 
     add_heading(doc, "5. Brief maturity score", level=1)
     maturity = doc_json.get("maturity", {}) or {}
-    add_paragraph(doc, _maturity_label(maturity.get("level", "draft")))
-    add_paragraph(doc, maturity.get("rationale", "") or "—")
+    rationale = maturity.get("rationale", "") or "—"
+    add_paragraph(doc, f"{_maturity_label(maturity.get('level', 'draft'))} {rationale}")
 
     doc.save(out_path)
 
@@ -554,7 +625,7 @@ class BriefInterpretatorGUI(tk.Tk):
         act.pack(fill="x", **pad)
 
         ttk.Button(act, text="Preview input", command=self.preview_input).pack(side="left", padx=8)
-        ttk.Button(act, text="Generate BICM (JSON + Word)", command=self.generate).pack(side="left", padx=8)
+        ttk.Button(act, text="Generate BICM (JSON)", command=self.generate).pack(side="left", padx=8)
         ttk.Button(act, text="Export Word (BICM)", command=self.save_word).pack(side="left", padx=8)
 
         self.status = ttk.Label(act, text="Ready.")
@@ -661,8 +732,7 @@ class BriefInterpretatorGUI(tk.Tk):
             self.generated_json = doc_json
             self._set_text(self.txt_json, json.dumps(doc_json, ensure_ascii=False, indent=2))
             self.log("[OK] Generated JSON.")
-            self.save_word(notify=False)
-            self.status.config(text="Generated & saved.")
+            self.status.config(text="Generated.")
         except Exception as e:
             messagebox.showerror("Generation error", str(e))
             self.log(f"[ERROR] generate: {e}")
@@ -670,41 +740,42 @@ class BriefInterpretatorGUI(tk.Tk):
 
     def save_word(self, notify: bool = True):
         if not self.generated_json:
-            messagebox.showinfo("No output", "Generate first.")
+            self.log("Nothing to export: generate interpretation first.")
             return
 
         try:
-            out_path, json_path = self._build_output_paths()
+            if Document is None:
+                self.log("Error: нужен python-docx для экспорта Word.")
+                return
+            out_path = self._ask_export_path()
+            if not out_path:
+                return
             render_docx(out_path, self.generated_json, self.generated_json.get("meta", {}))
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(self.generated_json, f, ensure_ascii=False, indent=2)
-            self.log(f"[BICM] word saved: {out_path}")
-            self.log(f"[BICM] json saved: {json_path}")
-            self.status.config(text="Saved.")
+            self.log(f"Exported Word: {out_path}")
+            self.status.config(text="Exported.")
             if notify:
-                messagebox.showinfo("Saved", f"{out_path}\n{json_path}")
+                messagebox.showinfo("Exported", out_path)
         except Exception as e:
             messagebox.showerror("Save error", str(e))
             self.log(f"[ERROR] save_word: {e}")
 
-    def _build_output_paths(self) -> tuple[str, str]:
+    def _ask_export_path(self) -> str:
         in_path = self.input_path.get() or "brief"
         base = os.path.splitext(os.path.basename(in_path))[0]
         base = re.sub(r"\s+", " ", base).strip() or "brief"
-        out_dir = os.path.dirname(in_path) or "."
-        docx_path = os.path.join(out_dir, f"{base}__BICM.docx")
-        json_path = os.path.join(out_dir, f"{base}__BICM.json")
-        return docx_path, json_path
+        initial = f"{base}__BICM.docx"
+        return filedialog.asksaveasfilename(
+            title="Export BICM Word",
+            defaultextension=".docx",
+            filetypes=[("Word document", "*.docx")],
+            initialfile=initial,
+        )
 
     def _detect_source_type(self) -> str:
         ext = os.path.splitext(self.input_path.get() or "")[1].lower()
-        if ext == ".docx":
-            return "Brief"
-        if ext == ".xlsx":
-            return "Guideline"
-        if ext == ".txt":
-            return "Call notes"
-        return "Mixed"
+        if ext in (".docx", ".xlsx", ".txt"):
+            return ext.lstrip(".")
+        return ""
 
 
 def main():
