@@ -165,55 +165,137 @@ def build_safe_brief_payload(source_path: str) -> dict:
 # -----------------------------
 # Prompting + JSON extraction
 # -----------------------------
-def make_target_template() -> dict:
+BICM_LAYERS = [
+    "BUSINESS_GOAL",
+    "RESEARCH_GOAL",
+    "DECISION_CONTEXT",
+    "SCOPE_AND_BOUNDARIES",
+    "TARGET_AUDIENCE",
+    "GEOGRAPHY",
+    "KEY_QUESTIONS",
+    "EXPECTED_OUTPUT",
+    "SUCCESS_CRITERIA",
+    "CONSTRAINTS",
+    "RISKS_AND_ASSUMPTIONS",
+]
+
+STATUS_TO_EMOJI = {
+    "filled": "🟢 Filled",
+    "partial": "🟡 Partial",
+    "missing": "🔴 Missing",
+}
+
+MATURITY_TO_LABEL = {
+    "draft": "🟥 Draft",
+    "workable": "🟨 Workable with risks",
+    "ready": "🟩 Contract-ready",
+}
+
+
+def make_bicm_template() -> dict:
     return {
-        "title": "",
-        "executive_summary": "",
-        "context": "",
-        "goal": "",
-        "tasks": [],
-        "research_questions": [],
-        "hypotheses": [],
-        "audience": "",
-        "segments": [],
-        "methodology": "",
-        "scope": "",
-        "constraints": [],
-        "deliverables": [],
-        "timeline": "",
-        "success_criteria": "",
-        "risks_open_questions": [],
-        "appendix_notes": "",
+        "meta": {"source_file": "", "source_type": "", "generated_at": "", "nda_status": "SAFE"},
+        "layers": [
+            {
+                "layer": layer,
+                "status": "missing",
+                "what_is_stated": [],
+                "gaps": [],
+                "note": "",
+            }
+            for layer in BICM_LAYERS
+        ],
+        "risk_map": {"critical_gaps": [], "interpretation_risks": [], "clear_points": []},
+        "maturity": {"level": "draft", "rationale": ""},
     }
 
 
-def _ensure_keys(obj: dict) -> dict:
-    tpl = make_target_template()
-    out = {k: obj.get(k, tpl[k]) for k in tpl.keys()}
+def _normalize_status(val: str) -> str:
+    v = (val or "").strip().lower()
+    if v in ("filled", "partial", "missing"):
+        return v
+    if v in ("full", "complete"):
+        return "filled"
+    if v in ("partly", "partial_fill"):
+        return "partial"
+    return "missing"
 
-    list_keys = ("tasks", "research_questions", "hypotheses", "segments", "constraints", "deliverables", "risks_open_questions")
-    for lk in list_keys:
-        v = out.get(lk, [])
-        if v is None:
-            v = []
-        if isinstance(v, str):
-            v = [v]
-        if not isinstance(v, list):
-            v = list(v)
-        out[lk] = [str(x).strip() for x in v if str(x).strip()]
 
-    str_keys = ("title", "executive_summary", "context", "goal", "audience", "methodology", "scope", "timeline", "success_criteria", "appendix_notes")
-    for sk in str_keys:
-        v = out.get(sk, "")
-        out[sk] = str(v).strip() if v is not None else ""
+def _ensure_bicm(obj: dict, meta: dict) -> dict:
+    tpl = make_bicm_template()
+    out = {
+        "meta": dict(tpl["meta"]),
+        "layers": [],
+        "risk_map": dict(tpl["risk_map"]),
+        "maturity": dict(tpl["maturity"]),
+    }
 
-    # enforce "не указано" where appropriate
-    for sk in ("executive_summary", "context", "goal", "audience", "methodology", "scope", "timeline", "success_criteria"):
-        if not out[sk]:
-            out[sk] = "не указано"
+    meta_in = obj.get("meta") if isinstance(obj, dict) else {}
+    if isinstance(meta_in, dict):
+        out["meta"].update({k: str(meta_in.get(k, "")).strip() for k in out["meta"].keys()})
+    out["meta"].update(meta)
 
-    if not out["title"]:
-        out["title"] = "Brief (SAFE)"
+    layers_in = obj.get("layers") if isinstance(obj, dict) else []
+    if not isinstance(layers_in, list):
+        layers_in = []
+
+    layer_map = {}
+    for item in layers_in:
+        if not isinstance(item, dict):
+            continue
+        layer_name = str(item.get("layer", "")).strip().upper()
+        if layer_name:
+            layer_map[layer_name] = item
+
+    for layer_name in BICM_LAYERS:
+        item = layer_map.get(layer_name, {})
+        status = _normalize_status(item.get("status"))
+        what_is_stated = item.get("what_is_stated", [])
+        gaps = item.get("gaps", [])
+        note = str(item.get("note", "") or "").strip()
+
+        if isinstance(what_is_stated, str):
+            what_is_stated = [what_is_stated]
+        if isinstance(gaps, str):
+            gaps = [gaps]
+        if not isinstance(what_is_stated, list):
+            what_is_stated = list(what_is_stated) if what_is_stated else []
+        if not isinstance(gaps, list):
+            gaps = list(gaps) if gaps else []
+
+        what_is_stated = [str(x).strip() for x in what_is_stated if str(x).strip()]
+        gaps = [str(x).strip() for x in gaps if str(x).strip()]
+
+        if status == "missing":
+            what_is_stated = []
+
+        out["layers"].append(
+            {
+                "layer": layer_name,
+                "status": status,
+                "what_is_stated": what_is_stated,
+                "gaps": gaps,
+                "note": note,
+            }
+        )
+
+    risk_map_in = obj.get("risk_map") if isinstance(obj, dict) else {}
+    if isinstance(risk_map_in, dict):
+        for key in out["risk_map"].keys():
+            items = risk_map_in.get(key, [])
+            if isinstance(items, str):
+                items = [items]
+            if not isinstance(items, list):
+                items = list(items) if items else []
+            out["risk_map"][key] = [str(x).strip() for x in items if str(x).strip()]
+
+    maturity_in = obj.get("maturity") if isinstance(obj, dict) else {}
+    if isinstance(maturity_in, dict):
+        level = (maturity_in.get("level") or "").strip().lower()
+        if level not in MATURITY_TO_LABEL:
+            level = "draft"
+        out["maturity"]["level"] = level
+        out["maturity"]["rationale"] = str(maturity_in.get("rationale", "") or "").strip()
 
     return out
 
@@ -235,15 +317,21 @@ def extract_json_strict(text: str) -> dict:
 
 
 def build_instruction(tone: str) -> str:
-    tpl = json.dumps(make_target_template(), ensure_ascii=False, indent=2)
+    tpl = json.dumps(make_bicm_template(), ensure_ascii=False, indent=2)
+    layers_text = "\n".join([f"- {layer}" for layer in BICM_LAYERS])
     return (
         "Ты — старший методолог и редактор. Получаешь обезличенный SAFE-бриф.\n"
-        "Задача: сделать чёткий, понятный, красиво структурированный документ.\n"
+        "Задача: сформировать контрактный BICM-отчёт.\n"
         "Строгие правила:\n"
-        "1) НИЧЕГО не выдумывай. Если данных нет — пиши 'не указано' или оставляй список пустым.\n"
-        "2) Сохраняй максимум смысла и деталей, которые есть в исходнике.\n"
-        "3) Перефразируй, не копируй длинные куски дословно.\n"
-        "4) Тон: " + (tone or "деловой, чёткий, без лишних слов") + "\n"
+        "1) НИЧЕГО не выдумывай. Только то, что явно есть в SAFE-входе.\n"
+        "2) Используй короткие деловые буллеты на русском языке.\n"
+        "3) Никаких брендов, доменных имён, имён людей, точных адресов.\n"
+        "   Если встречается — замени токенами BRAND_#, DOMAIN_#, PERSON_#, GEO_#.\n"
+        "4) Статусы только: filled / partial / missing.\n"
+        "5) Если данных по слою нет — status=missing и what_is_stated пустой.\n"
+        "6) Слои строго в таком порядке:\n"
+        f"{layers_text}\n"
+        "7) Тон: " + (tone or "деловой, чёткий, без лишних слов") + "\n"
         "Верни РОВНО один JSON-объект без пояснений, без обёрток, без markdown.\n"
         "JSON должен иметь такую структуру (поля и типы должны совпадать):\n"
         f"{tpl}\n"
@@ -253,7 +341,7 @@ def build_instruction(tone: str) -> str:
 # -----------------------------
 # OpenAI call (multi-SDK)
 # -----------------------------
-def call_llm_to_json(api_key: str, model: str, payload: dict, tone: str) -> dict:
+def call_llm_to_json(api_key: str, model: str, payload: dict, tone: str, meta: dict) -> dict:
     instruction = build_instruction(tone)
 
     user_obj = {
@@ -280,7 +368,7 @@ def call_llm_to_json(api_key: str, model: str, payload: dict, tone: str) -> dict
             out_text = getattr(resp, "output_text", None)
             if not out_text:
                 out_text = json.dumps(resp.model_dump(), ensure_ascii=False)
-            return _ensure_keys(extract_json_strict(out_text))
+            return _ensure_bicm(extract_json_strict(out_text), meta)
 
         except TypeError:
             # response_format not supported
@@ -294,7 +382,7 @@ def call_llm_to_json(api_key: str, model: str, payload: dict, tone: str) -> dict
             out_text = getattr(resp, "output_text", None)
             if not out_text:
                 out_text = json.dumps(resp.model_dump(), ensure_ascii=False)
-            return _ensure_keys(extract_json_strict(out_text))
+            return _ensure_bicm(extract_json_strict(out_text), meta)
 
         except Exception:
             # fall through to legacy if possible
@@ -316,7 +404,7 @@ def call_llm_to_json(api_key: str, model: str, payload: dict, tone: str) -> dict
             temperature=0.2,
         )
         text = resp["choices"][0]["message"]["content"]
-        return _ensure_keys(extract_json_strict(text))
+        return _ensure_bicm(extract_json_strict(text), meta)
     except AttributeError:
         raise RuntimeError("Your openai package is too old/odd. Upgrade: pip install -U openai")
 
@@ -340,44 +428,78 @@ def add_bullets(doc: Document, items: list[str]):
         doc.add_paragraph(t, style="List Bullet")
 
 
+def _status_label(status: str) -> str:
+    return STATUS_TO_EMOJI.get(status, "🔴 Missing")
+
+
+def _maturity_label(level: str) -> str:
+    return MATURITY_TO_LABEL.get(level, "🟥 Draft")
+
+
 def render_docx(out_path: str, doc_json: dict, meta: dict):
     doc = Document()
 
-    title = (doc_json.get("title") or "").strip() or "Brief (SAFE)"
-    add_heading(doc, title, level=0)
+    add_heading(doc, "BICM Interpretation (SAFE)", level=0)
 
-    meta_line = f"Source: {meta.get('source_file','')} | Generated: {meta.get('generated_at','')} | Model: {meta.get('model','')}"
-    p = doc.add_paragraph(meta_line)
-    if p.runs:
-        p.runs[0].italic = True
+    add_heading(doc, "1. Паспорт интерпретации", level=1)
+    add_paragraph(doc, f"Источник: {meta.get('source_file','')}")
+    add_paragraph(doc, f"Тип источника: {meta.get('source_type','Mixed')}")
+    add_paragraph(doc, f"Дата генерации: {meta.get('generated_at','')}")
+    add_paragraph(doc, "NDA-статус: SAFE")
+    add_paragraph(doc, "Цель интерпретации: приведение к контрактно-читаемому виду для оценки полноты и рисков")
 
-    def sec(name: str, value: str):
-        add_heading(doc, name, level=1)
-        add_paragraph(doc, (value or "не указано").strip() or "не указано")
+    add_heading(doc, "2. Карта контрактных слоёв", level=1)
+    table = doc.add_table(rows=1, cols=3)
+    hdr_cells = table.rows[0].cells
+    hdr_cells[0].text = "Contract layer"
+    hdr_cells[1].text = "Status"
+    hdr_cells[2].text = "Comment"
 
-    def seclist(name: str, items: list[str]):
-        add_heading(doc, name, level=1)
-        if not items:
-            add_paragraph(doc, "не указано")
+    for layer in doc_json.get("layers", []):
+        row_cells = table.add_row().cells
+        row_cells[0].text = layer.get("layer", "")
+        row_cells[1].text = _status_label(layer.get("status", "missing"))
+        row_cells[2].text = layer.get("note", "") or ""
+
+    add_heading(doc, "3. Расшифровка по слоям", level=1)
+    for layer in doc_json.get("layers", []):
+        layer_name = layer.get("layer", "")
+        add_heading(doc, f"LAYER: {layer_name}", level=2)
+        add_paragraph(doc, f"Status: {_status_label(layer.get('status', 'missing'))}")
+
+        add_paragraph(doc, "What is stated:")
+        what_is_stated = layer.get("what_is_stated", []) or []
+        if what_is_stated:
+            add_bullets(doc, what_is_stated)
         else:
-            add_bullets(doc, items)
+            add_paragraph(doc, "—")
 
-    sec("Executive summary", doc_json.get("executive_summary", "не указано"))
-    sec("Context", doc_json.get("context", "не указано"))
-    sec("Goal", doc_json.get("goal", "не указано"))
-    seclist("Tasks", doc_json.get("tasks", []))
-    seclist("Research questions", doc_json.get("research_questions", []))
-    seclist("Hypotheses", doc_json.get("hypotheses", []))
-    sec("Audience", doc_json.get("audience", "не указано"))
-    seclist("Segments", doc_json.get("segments", []))
-    sec("Methodology", doc_json.get("methodology", "не указано"))
-    sec("Scope", doc_json.get("scope", "не указано"))
-    seclist("Constraints", doc_json.get("constraints", []))
-    seclist("Deliverables", doc_json.get("deliverables", []))
-    sec("Timeline", doc_json.get("timeline", "не указано"))
-    sec("Success criteria", doc_json.get("success_criteria", "не указано"))
-    seclist("Risks / open questions", doc_json.get("risks_open_questions", []))
-    sec("Appendix notes", doc_json.get("appendix_notes", "не указано"))
+        add_paragraph(doc, "Gaps / ambiguity:")
+        gaps = layer.get("gaps", []) or []
+        if gaps:
+            add_bullets(doc, gaps)
+        else:
+            add_paragraph(doc, "—")
+
+        add_paragraph(doc, f"Interpreter note: {layer.get('note', '') or '—'}")
+
+    add_heading(doc, "4. Risk map", level=1)
+    def risk_block(label: str, items: list[str]):
+        add_paragraph(doc, label)
+        if items:
+            add_bullets(doc, items)
+        else:
+            add_paragraph(doc, "—")
+
+    risk_map = doc_json.get("risk_map", {}) or {}
+    risk_block("🔴 Critical gaps", risk_map.get("critical_gaps", []) or [])
+    risk_block("🟡 Interpretation risks", risk_map.get("interpretation_risks", []) or [])
+    risk_block("🟢 Fixed / clear", risk_map.get("clear_points", []) or [])
+
+    add_heading(doc, "5. Brief maturity score", level=1)
+    maturity = doc_json.get("maturity", {}) or {}
+    add_paragraph(doc, _maturity_label(maturity.get("level", "draft")))
+    add_paragraph(doc, maturity.get("rationale", "") or "—")
 
     doc.save(out_path)
 
@@ -432,8 +554,8 @@ class BriefInterpretatorGUI(tk.Tk):
         act.pack(fill="x", **pad)
 
         ttk.Button(act, text="Preview input", command=self.preview_input).pack(side="left", padx=8)
-        ttk.Button(act, text="Generate clean DOC (JSON + Word)", command=self.generate).pack(side="left", padx=8)
-        ttk.Button(act, text="Save Word…", command=self.save_word).pack(side="left", padx=8)
+        ttk.Button(act, text="Generate BICM (JSON + Word)", command=self.generate).pack(side="left", padx=8)
+        ttk.Button(act, text="Export Word (BICM)", command=self.save_word).pack(side="left", padx=8)
 
         self.status = ttk.Label(act, text="Ready.")
         self.status.pack(side="left", padx=12)
@@ -522,52 +644,67 @@ class BriefInterpretatorGUI(tk.Tk):
         self._set_text(self.txt_log, "")
 
         try:
+            meta = {
+                "source_file": os.path.basename(self.input_path.get()),
+                "source_type": self._detect_source_type(),
+                "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+                "nda_status": "SAFE",
+            }
+            self.log("[BICM] building layers...")
             doc_json = call_llm_to_json(
                 api_key=self.api_key.get().strip(),
                 model=self.model.get().strip(),
                 payload=self.payload,
                 tone=self.tone.get().strip() or "деловой, чёткий, без лишних слов",
+                meta=meta,
             )
             self.generated_json = doc_json
             self._set_text(self.txt_json, json.dumps(doc_json, ensure_ascii=False, indent=2))
             self.log("[OK] Generated JSON.")
-            self.status.config(text="Generated. You can save Word.")
+            self.save_word(notify=False)
+            self.status.config(text="Generated & saved.")
         except Exception as e:
             messagebox.showerror("Generation error", str(e))
             self.log(f"[ERROR] generate: {e}")
             self.status.config(text="Error.")
 
-    def save_word(self):
+    def save_word(self, notify: bool = True):
         if not self.generated_json:
             messagebox.showinfo("No output", "Generate first.")
             return
 
-        base = os.path.splitext(os.path.basename(self.input_path.get() or "brief"))[0]
-        base = re.sub(r"\s+", " ", base).strip()
-        default_name = f"{base}__clean.docx" if base else "brief__clean.docx"
-
-        out_path = filedialog.asksaveasfilename(
-            title="Save clean Word document",
-            defaultextension=".docx",
-            initialfile=default_name,
-            filetypes=[("Word document", "*.docx")],
-        )
-        if not out_path:
-            return
-
         try:
-            meta = {
-                "source_file": os.path.basename(self.input_path.get()),
-                "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
-                "model": self.model.get(),
-            }
-            render_docx(out_path, self.generated_json, meta)
-            self.log(f"[OK] Saved Word: {out_path}")
+            out_path, json_path = self._build_output_paths()
+            render_docx(out_path, self.generated_json, self.generated_json.get("meta", {}))
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(self.generated_json, f, ensure_ascii=False, indent=2)
+            self.log(f"[BICM] word saved: {out_path}")
+            self.log(f"[BICM] json saved: {json_path}")
             self.status.config(text="Saved.")
-            messagebox.showinfo("Saved", out_path)
+            if notify:
+                messagebox.showinfo("Saved", f"{out_path}\n{json_path}")
         except Exception as e:
             messagebox.showerror("Save error", str(e))
             self.log(f"[ERROR] save_word: {e}")
+
+    def _build_output_paths(self) -> tuple[str, str]:
+        in_path = self.input_path.get() or "brief"
+        base = os.path.splitext(os.path.basename(in_path))[0]
+        base = re.sub(r"\s+", " ", base).strip() or "brief"
+        out_dir = os.path.dirname(in_path) or "."
+        docx_path = os.path.join(out_dir, f"{base}__BICM.docx")
+        json_path = os.path.join(out_dir, f"{base}__BICM.json")
+        return docx_path, json_path
+
+    def _detect_source_type(self) -> str:
+        ext = os.path.splitext(self.input_path.get() or "")[1].lower()
+        if ext == ".docx":
+            return "Brief"
+        if ext == ".xlsx":
+            return "Guideline"
+        if ext == ".txt":
+            return "Call notes"
+        return "Mixed"
 
 
 def main():
