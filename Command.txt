@@ -1,4 +1,0 @@
-python nda_firewall_gui
-python interpritator_gui.py
-python core_tags_generator.py
-python study_classifier.py
