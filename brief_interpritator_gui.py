@@ -190,8 +190,8 @@ STATUS_TO_EMOJI = {
 
 MATURITY_TO_LABEL = {
     "draft": "🟥 Draft",
-    "medium": "🟨 Medium",
-    "mature": "🟩 Mature",
+    "workable": "🟨 Workable",
+    "contract_ready": "🟩 Contract-ready",
 }
 
 RU_LAYER_PATHS = {
@@ -199,14 +199,27 @@ RU_LAYER_PATHS = {
     "RESEARCH_GOAL": "Цели/Исследовательская цель",
     "DECISION_CONTEXT": "Контекст/Решение и зачем",
     "SCOPE_AND_BOUNDARIES": "Объём/Границы и рамки",
-    "TARGET_AUDIENCE": "Аудитория/ЦА",
+    "TARGET_AUDIENCE": "Аудитория/Целевая аудитория",
     "GEOGRAPHY": "География/Регионы",
     "KEY_QUESTIONS": "Вопросы/Ключевые вопросы",
     "EXPECTED_OUTPUT": "Результаты/Ожидаемые материалы",
     "SUCCESS_CRITERIA": "Критерии/Успех",
-    "CONSTRAINTS": "Ограничения/Сроки, бюджет, орг. ограничения",
+    "CONSTRAINTS": "Ограничения/Сроки и условия",
     "RISKS_AND_ASSUMPTIONS": "Риски/Допущения",
 }
+
+
+def make_llm_template() -> dict:
+    return {
+        "layers": [
+            {
+                "layer": layer,
+                "what_is_stated": [{"text": "", "anchor": ""}],
+                "gaps": [],
+            }
+            for layer in BICM_LAYERS
+        ]
+    }
 
 
 def make_bicm_template() -> dict:
@@ -215,10 +228,9 @@ def make_bicm_template() -> dict:
         "layers": [
             {
                 "layer": layer,
-                "status": "empty",
                 "what_is_stated": [],
                 "gaps": [],
-                "note": "",
+                "status": "empty",
             }
             for layer in BICM_LAYERS
         ],
@@ -227,32 +239,13 @@ def make_bicm_template() -> dict:
     }
 
 
-def _normalize_status(val: str) -> str:
-    v = (val or "").strip().lower()
-    if v in ("filled", "partial", "empty"):
-        return v
-    if v in ("full", "complete"):
-        return "filled"
-    if v in ("partly", "partial_fill"):
-        return "partial"
-    if v in ("missing", "none"):
-        return "empty"
-    return "empty"
+def _normalize_anchor(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
 
 
-def _ensure_bicm(obj: dict, meta: dict) -> dict:
-    tpl = make_bicm_template()
-    out = {
-        "meta": dict(tpl["meta"]),
-        "layers": [],
-        "risk_map": dict(tpl["risk_map"]),
-        "maturity": dict(tpl["maturity"]),
-    }
-
-    meta_in = obj.get("meta") if isinstance(obj, dict) else {}
-    if isinstance(meta_in, dict):
-        out["meta"].update({k: str(meta_in.get(k, "")).strip() for k in out["meta"].keys()})
-    out["meta"].update(meta)
+def _ensure_llm_payload(obj: dict) -> dict:
+    tpl = make_llm_template()
+    out = {"layers": []}
 
     layers_in = obj.get("layers") if isinstance(obj, dict) else []
     if not isinstance(layers_in, list):
@@ -268,59 +261,128 @@ def _ensure_bicm(obj: dict, meta: dict) -> dict:
 
     for layer_name in BICM_LAYERS:
         item = layer_map.get(layer_name, {})
-        status = _normalize_status(item.get("status"))
         what_is_stated = item.get("what_is_stated", [])
         gaps = item.get("gaps", [])
-        note = str(item.get("note", "") or "").strip()
 
-        if isinstance(what_is_stated, str):
+        if isinstance(what_is_stated, dict):
             what_is_stated = [what_is_stated]
-        if isinstance(gaps, str):
-            gaps = [gaps]
+        if isinstance(what_is_stated, str):
+            what_is_stated = [{"text": what_is_stated, "anchor": ""}]
         if not isinstance(what_is_stated, list):
             what_is_stated = list(what_is_stated) if what_is_stated else []
+
+        if isinstance(gaps, str):
+            gaps = [gaps]
         if not isinstance(gaps, list):
             gaps = list(gaps) if gaps else []
 
-        what_is_stated = [str(x).strip() for x in what_is_stated if str(x).strip()]
-        gaps = [str(x).strip() for x in gaps if str(x).strip()]
+        normalized_items = []
+        for entry in what_is_stated:
+            if isinstance(entry, str):
+                text = entry
+                anchor = ""
+            elif isinstance(entry, dict):
+                text = entry.get("text", "")
+                anchor = entry.get("anchor", "")
+            else:
+                continue
+            text = _normalize_anchor(text)
+            anchor = _normalize_anchor(anchor)
+            if not text and not anchor:
+                continue
+            normalized_items.append({"text": text, "anchor": anchor})
 
+        gaps = [_normalize_anchor(x) for x in gaps if _normalize_anchor(x)]
+
+        out["layers"].append(
+            {
+                "layer": layer_name,
+                "what_is_stated": normalized_items,
+                "gaps": gaps,
+            }
+        )
+
+    if not out["layers"]:
+        out = tpl
+
+    return out
+
+
+def _derive_layer_status(what_is_stated: list[dict]) -> str:
+    count = len([x for x in what_is_stated if str(x.get("text", "") or "").strip()])
+    if count >= 3:
+        return "filled"
+    if count >= 1:
+        return "partial"
+    return "empty"
+
+
+def _build_risk_map(layers: list[dict]) -> dict:
+    critical = []
+    risks = []
+    clear = []
+    for layer in layers:
+        status = layer.get("status")
+        name = _ru_layer_path(layer.get("layer", ""))
         if status == "empty":
-            what_is_stated = []
+            critical.append(name)
+        elif status == "partial":
+            risks.append(name)
+        else:
+            clear.append(name)
+    return {"critical_gaps": critical, "interpretation_risks": risks, "clear_points": clear}
 
+
+def _derive_maturity(layers: list[dict]) -> dict:
+    empty_count = sum(1 for layer in layers if layer.get("status") == "empty")
+    partial_count = sum(1 for layer in layers if layer.get("status") == "partial")
+    if empty_count > 0:
+        return {"level": "draft", "rationale": "Есть критические пробелы."}
+    if partial_count > 0:
+        return {"level": "workable", "rationale": "Есть интерпретационные риски."}
+    return {"level": "contract_ready", "rationale": "Контрактные слои заполнены."}
+
+
+def build_bicm_report(llm_payload: dict, meta: dict) -> dict:
+    tpl = make_bicm_template()
+    out = {
+        "meta": dict(tpl["meta"]),
+        "layers": [],
+        "risk_map": dict(tpl["risk_map"]),
+        "maturity": dict(tpl["maturity"]),
+    }
+
+    out["meta"].update({k: str(meta.get(k, "")).strip() for k in out["meta"].keys()})
+
+    layers_in = llm_payload.get("layers", []) if isinstance(llm_payload, dict) else []
+    layer_map = {}
+    for item in layers_in:
+        if not isinstance(item, dict):
+            continue
+        layer_name = str(item.get("layer", "")).strip().upper()
+        if layer_name:
+            layer_map[layer_name] = item
+
+    for layer_name in BICM_LAYERS:
+        item = layer_map.get(layer_name, {})
+        what_is_stated = item.get("what_is_stated", []) or []
+        gaps = item.get("gaps", []) or []
+        if not isinstance(what_is_stated, list):
+            what_is_stated = []
+        if not isinstance(gaps, list):
+            gaps = []
+        status = _derive_layer_status(what_is_stated)
         out["layers"].append(
             {
                 "layer": layer_name,
                 "status": status,
                 "what_is_stated": what_is_stated,
                 "gaps": gaps,
-                "note": note,
             }
         )
 
-    risk_map_in = obj.get("risk_map") if isinstance(obj, dict) else {}
-    if isinstance(risk_map_in, dict):
-        for key in out["risk_map"].keys():
-            items = risk_map_in.get(key, [])
-            if isinstance(items, str):
-                items = [items]
-            if not isinstance(items, list):
-                items = list(items) if items else []
-            out["risk_map"][key] = [str(x).strip() for x in items if str(x).strip()]
-
-    maturity_in = obj.get("maturity") if isinstance(obj, dict) else {}
-    if isinstance(maturity_in, dict):
-        level = (maturity_in.get("level") or "").strip().lower()
-        if level not in MATURITY_TO_LABEL:
-            if level == "workable":
-                level = "medium"
-            elif level == "ready":
-                level = "mature"
-            else:
-                level = "draft"
-        out["maturity"]["level"] = level
-        out["maturity"]["rationale"] = str(maturity_in.get("rationale", "") or "").strip()
-
+    out["risk_map"] = _build_risk_map(out["layers"])
+    out["maturity"] = _derive_maturity(out["layers"])
     return out
 
 
@@ -341,21 +403,22 @@ def extract_json_strict(text: str) -> dict:
 
 
 def build_instruction(tone: str) -> str:
-    tpl = json.dumps(make_bicm_template(), ensure_ascii=False, indent=2)
+    tpl = json.dumps(make_llm_template(), ensure_ascii=False, indent=2)
     layers_text = "\n".join([f"- {layer}" for layer in BICM_LAYERS])
     return (
         "Ты — старший методолог и редактор. Получаешь обезличенный SAFE-бриф.\n"
-        "Задача: сформировать контрактный BICM-отчёт.\n"
+        "Задача: извлечь ТОЛЬКО смыслы для контрактного отчёта (без оценок).\n"
         "Строгие правила:\n"
         "1) НИЧЕГО не выдумывай. Только то, что явно есть в SAFE-входе.\n"
-        "2) Используй короткие деловые буллеты на русском языке.\n"
-        "3) Никаких брендов, доменных имён, имён людей, точных адресов.\n"
+        "2) Никаких выводов о зрелости/качестве. Никаких оценок.\n"
+        "3) Никаких чисел и цифр.\n"
+        "4) Никаких брендов, доменных имён, имён людей, точных адресов.\n"
         "   Если встречается — замени токенами BRAND_#, DOMAIN_#, PERSON_#, GEO_#.\n"
-        "4) Статусы только: filled / partial / empty.\n"
-        "5) Если данных по слою нет — status=empty и what_is_stated пустой.\n"
-        "6) Слои строго в таком порядке:\n"
+        "5) Для каждого слоя: что сказано (text) + короткий anchor (цитата от пяти до двадцати пяти слов).\n"
+        "6) Если данных по слою нет — what_is_stated пустой список. gaps может быть пустым.\n"
+        "7) Слои строго в таком порядке:\n"
         f"{layers_text}\n"
-        "7) Тон: " + (tone or "деловой, чёткий, без лишних слов") + "\n"
+        "8) Тон: " + (tone or "деловой, чёткий, без лишних слов") + "\n"
         "Верни РОВНО один JSON-объект без пояснений, без обёрток, без markdown.\n"
         "JSON должен иметь такую структуру (поля и типы должны совпадать):\n"
         f"{tpl}\n"
@@ -365,7 +428,7 @@ def build_instruction(tone: str) -> str:
 # -----------------------------
 # OpenAI call (multi-SDK)
 # -----------------------------
-def call_llm_to_json(api_key: str, model: str, payload: dict, tone: str, meta: dict) -> dict:
+def call_llm_to_json(api_key: str, model: str, payload: dict, tone: str) -> dict:
     instruction = build_instruction(tone)
 
     user_obj = {
@@ -392,7 +455,7 @@ def call_llm_to_json(api_key: str, model: str, payload: dict, tone: str, meta: d
             out_text = getattr(resp, "output_text", None)
             if not out_text:
                 out_text = json.dumps(resp.model_dump(), ensure_ascii=False)
-            return _ensure_bicm(extract_json_strict(out_text), meta)
+            return _ensure_llm_payload(extract_json_strict(out_text))
 
         except TypeError:
             # response_format not supported
@@ -406,7 +469,7 @@ def call_llm_to_json(api_key: str, model: str, payload: dict, tone: str, meta: d
             out_text = getattr(resp, "output_text", None)
             if not out_text:
                 out_text = json.dumps(resp.model_dump(), ensure_ascii=False)
-            return _ensure_bicm(extract_json_strict(out_text), meta)
+            return _ensure_llm_payload(extract_json_strict(out_text))
 
         except Exception:
             # fall through to legacy if possible
@@ -428,7 +491,7 @@ def call_llm_to_json(api_key: str, model: str, payload: dict, tone: str, meta: d
             temperature=0.2,
         )
         text = resp["choices"][0]["message"]["content"]
-        return _ensure_bicm(extract_json_strict(text), meta)
+        return _ensure_llm_payload(extract_json_strict(text))
     except AttributeError:
         raise RuntimeError("Your openai package is too old/odd. Upgrade: pip install -U openai")
 
@@ -464,41 +527,25 @@ def _ru_layer_path(layer_name: str) -> str:
     return RU_LAYER_PATHS.get((layer_name or "").strip().upper(), (layer_name or "").strip())
 
 
-def _meaningful_points(items: list[str]) -> int:
-    count = 0
-    for it in items or []:
-        text = str(it or "").strip()
-        if not text:
-            continue
-        if len(re.sub(r"\W+", "", text)) < 3:
-            continue
-        count += 1
-    return count
-
-
-def _derive_layer_status(layer: dict) -> str:
-    what_is_stated = layer.get("what_is_stated", []) or []
-    gaps = layer.get("gaps", []) or []
-    if isinstance(what_is_stated, str):
-        what_is_stated = [what_is_stated]
-    if isinstance(gaps, str):
-        gaps = [gaps]
-    count = _meaningful_points(what_is_stated)
-    if count == 0:
-        return "empty"
-    if count >= 2 and not gaps:
-        return "filled"
-    return "partial"
-
-
 def _layer_comment(layer: dict) -> str:
-    note = str(layer.get("note", "") or "").strip()
-    if note:
-        return note.splitlines()[0]
-    gaps = layer.get("gaps", []) or []
-    if gaps:
-        return "Есть пробелы/неясности"
-    return "—"
+    status = layer.get("status", "empty")
+    if status == "filled":
+        return "Заполнено"
+    if status == "partial":
+        return "Частично заполнено"
+    return "Нет данных"
+
+
+def _format_statement(item: dict) -> str:
+    text = _normalize_anchor(item.get("text", ""))
+    anchor = _normalize_anchor(item.get("anchor", ""))
+    if text and anchor:
+        return f"{text} — «{anchor}»"
+    if text:
+        return text
+    if anchor:
+        return f"«{anchor}»"
+    return ""
 
 
 def render_docx(out_path: str, doc_json: dict, meta: dict):
@@ -520,28 +567,28 @@ def render_docx(out_path: str, doc_json: dict, meta: dict):
     add_heading(doc, "2. Карта контрактных слоёв", level=1)
     table = doc.add_table(rows=1, cols=3)
     hdr_cells = table.rows[0].cells
-    hdr_cells[0].text = "Contract layer (RU path)"
-    hdr_cells[1].text = "Status"
-    hdr_cells[2].text = "Comment"
+    hdr_cells[0].text = "Слой (RU path)"
+    hdr_cells[1].text = "Статус"
+    hdr_cells[2].text = "Комментарий"
 
     for layer in doc_json.get("layers", []):
-        status = _derive_layer_status(layer)
         row_cells = table.add_row().cells
         row_cells[0].text = _ru_layer_path(layer.get("layer", ""))
-        row_cells[1].text = _status_label(status)
+        row_cells[1].text = _status_label(layer.get("status", "empty"))
         row_cells[2].text = _layer_comment(layer)
 
     add_heading(doc, "3. Расшифровка по слоям", level=1)
     for layer in doc_json.get("layers", []):
         layer_name = _ru_layer_path(layer.get("layer", ""))
-        status = _derive_layer_status(layer)
         add_heading(doc, f"СЛОЙ: {layer_name}", level=2)
-        add_paragraph(doc, f"Статус: {_status_label(status)}")
+        add_paragraph(doc, f"Статус: {_status_label(layer.get('status', 'empty'))}")
 
         add_paragraph(doc, "Что сказано:")
         what_is_stated = layer.get("what_is_stated", []) or []
-        if what_is_stated:
-            add_bullets(doc, what_is_stated)
+        statements = [_format_statement(x) for x in what_is_stated if isinstance(x, dict)]
+        statements = [s for s in statements if s]
+        if statements:
+            add_bullets(doc, statements)
         else:
             add_paragraph(doc, "—")
 
@@ -551,8 +598,6 @@ def render_docx(out_path: str, doc_json: dict, meta: dict):
             add_bullets(doc, gaps)
         else:
             add_paragraph(doc, "—")
-
-        add_paragraph(doc, f"Примечание интерпретатора: {layer.get('note', '') or '—'}")
 
     add_heading(doc, "4. Risk map", level=1)
     def risk_block(label: str, items: list[str]):
@@ -567,7 +612,7 @@ def render_docx(out_path: str, doc_json: dict, meta: dict):
     risk_block("🟡 Interpretation risks", risk_map.get("interpretation_risks", []) or [])
     risk_block("🟢 Fixed / clear", risk_map.get("clear_points", []) or [])
 
-    add_heading(doc, "5. Brief maturity score", level=1)
+    add_heading(doc, "5. Brief maturity", level=1)
     maturity = doc_json.get("maturity", {}) or {}
     rationale = maturity.get("rationale", "") or "—"
     add_paragraph(doc, f"{_maturity_label(maturity.get('level', 'draft'))} {rationale}")
@@ -721,14 +766,15 @@ class BriefInterpretatorGUI(tk.Tk):
                 "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
                 "nda_status": "SAFE",
             }
-            self.log("[BICM] building layers...")
-            doc_json = call_llm_to_json(
+            self.log("[BICM] extracting layers via LLM")
+            llm_payload = call_llm_to_json(
                 api_key=self.api_key.get().strip(),
                 model=self.model.get().strip(),
                 payload=self.payload,
                 tone=self.tone.get().strip() or "деловой, чёткий, без лишних слов",
-                meta=meta,
             )
+            self.log("[BICM] deterministic scoring")
+            doc_json = build_bicm_report(llm_payload, meta)
             self.generated_json = doc_json
             self._set_text(self.txt_json, json.dumps(doc_json, ensure_ascii=False, indent=2))
             self.log("[OK] Generated JSON.")
@@ -750,8 +796,9 @@ class BriefInterpretatorGUI(tk.Tk):
             out_path = self._ask_export_path()
             if not out_path:
                 return
+            self.log("[BICM] building Word document")
             render_docx(out_path, self.generated_json, self.generated_json.get("meta", {}))
-            self.log(f"Exported Word: {out_path}")
+            self.log(f"[BICM] export completed: {out_path}")
             self.status.config(text="Exported.")
             if notify:
                 messagebox.showinfo("Exported", out_path)
