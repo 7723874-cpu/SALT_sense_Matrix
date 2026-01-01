@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 import tkinter as tk
@@ -67,6 +68,98 @@ GEO_TERMS_STRICT = GEO_TERMS + [
     "Australia",
     "India",
 ]
+
+STOP_WORDS = {
+    "brief",
+    "transcript",
+    "meeting",
+    "notes",
+    "note",
+    "interview",
+    "document",
+    "project",
+    "report",
+    "nda",
+    "draft",
+    "final",
+    "file",
+    "version",
+    "summary",
+    "analysis",
+    "output",
+}
+
+
+def make_short_hash(text):
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:6]
+
+
+def sanitize_windows_name(text):
+    sanitized = re.sub(r'[<>:"/\\\\|?*]', "_", text)
+    sanitized = re.sub(r"[\x00-\x1f]", "", sanitized)
+    sanitized = sanitized.strip().strip(".")
+    return sanitized
+
+
+def make_safe_project_id(selected_files, manual_label):
+    label = sanitize_windows_name(manual_label.strip()) if manual_label else ""
+    if label:
+        return label[:50]
+    hash_source = "|".join(selected_files) if selected_files else "empty"
+    return f"Project_{make_short_hash(hash_source)}"
+
+
+def extract_sensitive_tokens(paths):
+    tokens = set()
+    for path in paths:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        for part in re.split(r"[^A-Za-z0-9]+", stem):
+            part_clean = part.strip()
+            if len(part_clean) < 3:
+                continue
+            if part_clean.lower() in STOP_WORDS:
+                continue
+            tokens.add(part_clean)
+    return sorted(tokens, key=lambda value: (-len(value), value.lower()))
+
+
+def mask_sensitive_names(text, known_tokens):
+    if not text:
+        return text
+
+    token_map = {}
+    project_counter = 1
+    brand_counter = 1
+
+    def replace_known(match):
+        nonlocal project_counter
+        original = match.group(0)
+        key = original.lower()
+        token = token_map.get(key)
+        if token is None:
+            token = f"PROJECT_{project_counter}"
+            project_counter += 1
+            token_map[key] = token
+        return token
+
+    for token in known_tokens:
+        if not token:
+            continue
+        pattern = rf"\b{re.escape(token)}\b"
+        text = re.sub(pattern, replace_known, text, flags=re.IGNORECASE)
+
+    def replace_all_caps(match):
+        nonlocal brand_counter
+        original = match.group(0)
+        token = token_map.get(original)
+        if token is None:
+            token = f"BRAND_{brand_counter}"
+            brand_counter += 1
+            token_map[original] = token
+        return token
+
+    text = re.sub(r"\b[A-Z]{3,}\b", replace_all_caps, text)
+    return text
 
 
 def sanitize_text(
@@ -193,6 +286,8 @@ class BriefLegitimizerApp:
         self.root.title("NDA Firewall")
 
         self.file_path = tk.StringVar()
+        self.safe_mode_var = tk.BooleanVar(value=True)
+        self.project_label_var = tk.StringVar()
         self.mode_var = tk.StringVar(value="Balanced")
 
         self.replace_contacts_var = tk.BooleanVar()
@@ -201,6 +296,7 @@ class BriefLegitimizerApp:
         self.replace_geo_var = tk.BooleanVar()
         self.replace_numbers_var = tk.BooleanVar()
 
+        self.selected_file = ""
         self.original_text = ""
         self.sanitized_text = ""
         self.redaction_map = []
@@ -209,6 +305,8 @@ class BriefLegitimizerApp:
         self._build_ui()
         self.apply_mode_policy()
         self.mode_var.trace_add("write", self._on_mode_change)
+        self.safe_mode_var.trace_add("write", self._on_safe_mode_change)
+        self._update_unsafe_warning()
 
     def _build_ui(self):
         top_frame = ttk.Frame(self.root, padding=10)
@@ -249,6 +347,30 @@ class BriefLegitimizerApp:
             ttk.Radiobutton(
                 mode_frame, text=label, value=value, variable=self.mode_var
             ).pack(side="left", padx=(6, 0))
+
+        safety_frame = ttk.Frame(top_frame)
+        safety_frame.grid(row=2, column=0, columnspan=6, sticky="w", pady=(8, 0))
+
+        ttk.Checkbutton(
+            safety_frame,
+            text="SAFE mode (hide file/project names)",
+            variable=self.safe_mode_var,
+        ).pack(side="left")
+
+        self.unsafe_warning_label = ttk.Label(
+            safety_frame,
+            text="UNSAFE MODE: may reveal client/brand",
+            foreground="red",
+        )
+        self.unsafe_warning_label.pack(side="left", padx=(12, 0))
+
+        project_frame = ttk.Frame(top_frame)
+        project_frame.grid(row=3, column=0, columnspan=6, sticky="we", pady=(6, 0))
+
+        ttk.Label(project_frame, text="Project label (optional):").pack(side="left")
+        ttk.Entry(project_frame, textvariable=self.project_label_var, width=40).pack(
+            side="left", padx=(6, 0), fill="x", expand=True
+        )
 
         top_frame.columnconfigure(1, weight=1)
 
@@ -308,6 +430,10 @@ class BriefLegitimizerApp:
     def _on_mode_change(self, *_):
         self.apply_mode_policy()
 
+    def _on_safe_mode_change(self, *_):
+        self._refresh_file_display()
+        self._update_unsafe_warning()
+
     def apply_mode_policy(self):
         preset = MODE_PRESETS.get(self.mode_var.get(), MODE_PRESETS["Balanced"])
         self.replace_contacts_var.set(preset["replace_contacts"])
@@ -316,17 +442,49 @@ class BriefLegitimizerApp:
         self.replace_geo_var.set(preset["replace_geo"])
         self.replace_numbers_var.set(preset["replace_numbers"])
 
+    def _update_unsafe_warning(self):
+        if self.safe_mode_var.get():
+            self.unsafe_warning_label.configure(text="")
+        else:
+            self.unsafe_warning_label.configure(text="UNSAFE MODE: may reveal client/brand")
+
+    def _refresh_file_display(self):
+        if not self.selected_file:
+            self.file_path.set("")
+            return
+        if self.safe_mode_var.get():
+            self.file_path.set("File #1")
+        else:
+            self.file_path.set(self.selected_file)
+
+    def _current_file_label(self):
+        return "File #1" if self.safe_mode_var.get() else self.selected_file
+
+    def _get_project_label(self):
+        return make_safe_project_id([self.selected_file], self.project_label_var.get())
+
+    def _get_known_tokens(self):
+        tokens = extract_sensitive_tokens([self.selected_file])
+        manual_label = self.project_label_var.get().strip()
+        if manual_label:
+            manual_tokens = extract_sensitive_tokens([manual_label])
+            tokens.extend(manual_tokens)
+        return sorted(set(tokens), key=lambda value: (-len(value), value.lower()))
+
     def browse_file(self):
         path = filedialog.askopenfilename(
             title="Select brief file",
             filetypes=[
+                ("All files", "*.*"),
                 ("Documents", "*.docx *.txt"),
                 ("Word Document", "*.docx"),
                 ("Text", "*.txt"),
             ],
         )
         if path:
-            self.file_path.set(path)
+            self.selected_file = path
+            self._refresh_file_display()
+            self._update_unsafe_warning()
 
     def _load_text_from_file(self, path):
         if path.lower().endswith(".docx"):
@@ -336,7 +494,7 @@ class BriefLegitimizerApp:
             return handle.read()
 
     def preview_file(self):
-        path = self.file_path.get().strip()
+        path = self.selected_file
         if not path:
             messagebox.showwarning("Missing file", "Select a file first.")
             return
@@ -345,8 +503,15 @@ class BriefLegitimizerApp:
             return
         self.original_text = self._load_text_from_file(path)
         self.preview_text.delete("1.0", tk.END)
-        self.preview_text.insert(tk.END, self.original_text)
-        self._log("Preview loaded.")
+        if self.safe_mode_var.get():
+            masked_preview = mask_sensitive_names(
+                self.original_text, self._get_known_tokens()
+            )
+            self.preview_text.insert(tk.END, masked_preview)
+            self._log(f"Preview loaded for {self._current_file_label()}.")
+        else:
+            self.preview_text.insert(tk.END, self.original_text)
+            self._log(f"Preview loaded: {path}")
 
     def _log(self, message):
         self.log_text.insert(tk.END, message + "\n")
@@ -391,6 +556,10 @@ class BriefLegitimizerApp:
         )
 
         self.sanitized_text_widget.delete("1.0", tk.END)
+        if self.safe_mode_var.get():
+            self.sanitized_text = mask_sensitive_names(
+                self.sanitized_text, self._get_known_tokens()
+            )
         self.sanitized_text_widget.insert(tk.END, self.sanitized_text)
         self._log(
             f"[BRAND_REDACTION] domains={domain_replacements} brands={brand_replacements}"
@@ -402,18 +571,33 @@ class BriefLegitimizerApp:
             messagebox.showwarning("Missing output", "Run legitimization first.")
             return
 
+        project_label = self._get_project_label()
+        safe_mode = self.safe_mode_var.get()
+        if safe_mode:
+            initial_name = f"sanitized_output__{project_label}.txt"
+        else:
+            stem = os.path.splitext(os.path.basename(self.selected_file or "output"))[0]
+            initial_name = f"{stem}_sanitized.txt"
+
         path = filedialog.asksaveasfilename(
             title="Save SAFE TXT",
             defaultextension=".txt",
-            filetypes=[("Text File", "*.txt")],
+            initialfile=initial_name,
+            filetypes=[("All files", "*.*"), ("Text File", "*.txt")],
         )
         if not path:
             return
 
-        content = f"NDA SAFE TEXT\n\n{self.sanitized_text}"
+        header = "NDA Firewall Output (SAFE)" if safe_mode else "NDA Firewall Output (UNSAFE)"
+        if project_label:
+            header = f"{header}\nProject: {project_label}"
+        content = f"{header}\n\n{self.sanitized_text}"
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(content)
-        self._log(f"SAFE TXT exported: {path}")
+        if safe_mode:
+            self._log(f"SAFE TXT exported: {os.path.basename(path)}")
+        else:
+            self._log(f"SAFE TXT exported: {path}")
 
 
 if __name__ == "__main__":
