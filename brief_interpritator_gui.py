@@ -199,6 +199,83 @@ def try_parse_legitimizer_excel(path: str) -> dict | None:
         return None
 
 
+def _is_bullet_paragraph(p) -> bool:
+    try:
+        style_name = (p.style.name or "").lower()
+    except Exception:
+        style_name = ""
+    if "list" in style_name or "bullet" in style_name or "маркирован" in style_name:
+        return True
+    try:
+        if p._p.pPr is not None and p._p.pPr.numPr is not None:
+            return True
+    except Exception:
+        pass
+    text = (p.text or "").strip()
+    if re.match(r"^[•\-–—*]\s+", text):
+        return True
+    return False
+
+
+def parse_structure_docx(path: str) -> list[str]:
+    if Document is None:
+        return []
+    doc = Document(path)
+    paragraphs = []
+    for p in doc.paragraphs:
+        text = (p.text or "").strip()
+        if not text:
+            continue
+        paragraphs.append(
+            {
+                "text": text,
+                "is_bullet": _is_bullet_paragraph(p),
+                "style": (getattr(p.style, "name", "") or "").lower(),
+            }
+        )
+
+    if not paragraphs:
+        return []
+
+    header_idx = None
+    header_re = re.compile(r"ключевые\s+структурные\s+слои", re.IGNORECASE)
+    for idx, item in enumerate(paragraphs):
+        if header_re.search(item["text"]):
+            header_idx = idx
+            break
+
+    def collect_bullets(items: list[dict]) -> list[str]:
+        result = []
+        for entry in items:
+            if entry["is_bullet"]:
+                result.append(entry["text"])
+        return result
+
+    if header_idx is not None:
+        after_header = paragraphs[header_idx + 1 :]
+        collected = []
+        for entry in after_header:
+            if collected and ("heading" in entry["style"] or "заголовок" in entry["style"]):
+                break
+            if entry["is_bullet"]:
+                collected.append(entry["text"])
+        if collected:
+            return collected
+
+    bullets = collect_bullets(paragraphs)
+    if bullets:
+        return bullets
+
+    fallback = []
+    for idx, item in enumerate(paragraphs):
+        if header_idx is not None and idx == header_idx:
+            continue
+        if len(item["text"]) > 160:
+            continue
+        fallback.append(item["text"])
+    return fallback
+
+
 def build_safe_brief_payload(source_path: str) -> dict:
     ext = os.path.splitext(source_path)[1].lower()
 
@@ -228,18 +305,16 @@ def build_safe_brief_payload(source_path: str) -> dict:
 # -----------------------------
 # Prompting + JSON extraction
 # -----------------------------
-BICM_LAYERS = [
-    "BUSINESS_GOAL",
-    "RESEARCH_GOAL",
-    "DECISION_CONTEXT",
-    "SCOPE_AND_BOUNDARIES",
-    "TARGET_AUDIENCE",
-    "GEOGRAPHY",
-    "KEY_QUESTIONS",
-    "EXPECTED_OUTPUT",
-    "SUCCESS_CRITERIA",
-    "CONSTRAINTS",
-    "RISKS_AND_ASSUMPTIONS",
+DEFAULT_LAYER_TITLES = [
+    "Цели исследования",
+    "Бизнес-цели и контекст применения",
+    "Рамки исследования",
+    "Этнография",
+    "Ключевые исследовательские вопросы и направления анализа",
+    "Объемы, типы и форматы итоговых материалов",
+    "Критерии успеха",
+    "Сроки, условия, организационные и методологические ограничения",
+    "Риски и допущения — потенциальные зоны неопределённости и предположения",
 ]
 
 STATUS_TO_EMOJI = {
@@ -254,45 +329,109 @@ MATURITY_TO_LABEL = {
     "contract_ready": "🟩 Contract-ready",
 }
 
-RU_LAYER_PATHS = {
-    "BUSINESS_GOAL": "Цели/Бизнес-цель",
-    "RESEARCH_GOAL": "Цели/Исследовательская цель",
-    "DECISION_CONTEXT": "Контекст/Решение и зачем",
-    "SCOPE_AND_BOUNDARIES": "Объём/Границы и рамки",
-    "TARGET_AUDIENCE": "Аудитория/Целевая аудитория",
-    "GEOGRAPHY": "География/Регионы",
-    "KEY_QUESTIONS": "Вопросы/Ключевые вопросы",
-    "EXPECTED_OUTPUT": "Результаты/Ожидаемые материалы",
-    "SUCCESS_CRITERIA": "Критерии/Успех",
-    "CONSTRAINTS": "Ограничения/Сроки и условия",
-    "RISKS_AND_ASSUMPTIONS": "Риски/Допущения",
-}
+
+def _transliterate_ru(text: str) -> str:
+    mapping = {
+        "а": "a",
+        "б": "b",
+        "в": "v",
+        "г": "g",
+        "д": "d",
+        "е": "e",
+        "ё": "e",
+        "ж": "zh",
+        "з": "z",
+        "и": "i",
+        "й": "y",
+        "к": "k",
+        "л": "l",
+        "м": "m",
+        "н": "n",
+        "о": "o",
+        "п": "p",
+        "р": "r",
+        "с": "s",
+        "т": "t",
+        "у": "u",
+        "ф": "f",
+        "х": "h",
+        "ц": "ts",
+        "ч": "ch",
+        "ш": "sh",
+        "щ": "sch",
+        "ъ": "",
+        "ы": "y",
+        "ь": "",
+        "э": "e",
+        "ю": "yu",
+        "я": "ya",
+    }
+    out = []
+    for ch in (text or ""):
+        low = ch.lower()
+        if low in mapping:
+            out.append(mapping[low])
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
-def make_llm_template() -> dict:
+def _normalize_layer_id(text: str) -> str:
+    text = _transliterate_ru(text or "")
+    text = text.upper()
+    text = re.sub(r"[^A-Z0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text
+
+
+def build_layer_specs(layer_titles: list[str]) -> list[dict]:
+    seen = {}
+    specs = []
+    for idx, title in enumerate(layer_titles or [], start=1):
+        raw_title = (title or "").strip()
+        if not raw_title:
+            continue
+        base_id = _normalize_layer_id(raw_title)
+        if not base_id:
+            base_id = f"LAYER_{idx}"
+        layer_id = base_id
+        if layer_id in seen:
+            suffix = seen[layer_id] + 1
+            while f"{base_id}_{suffix}" in seen:
+                suffix += 1
+            layer_id = f"{base_id}_{suffix}"
+            seen[base_id] = suffix
+        seen[layer_id] = 1
+        specs.append({"layer_id": layer_id, "layer_title": raw_title})
+    return specs
+
+
+def make_llm_template(layer_specs: list[dict]) -> dict:
     return {
         "layers": [
             {
-                "layer": layer,
+                "layer_id": layer["layer_id"],
+                "layer_title": layer["layer_title"],
                 "what_is_stated": [{"text": "", "anchor": ""}],
                 "gaps": [],
             }
-            for layer in BICM_LAYERS
+            for layer in layer_specs
         ]
     }
 
 
-def make_bicm_template() -> dict:
+def make_bicm_template(layer_specs: list[dict]) -> dict:
     return {
         "meta": {"source_file": "", "source_type": "", "generated_at": "", "nda_status": "SAFE"},
         "layers": [
             {
-                "layer": layer,
+                "layer_id": layer["layer_id"],
+                "layer_title": layer["layer_title"],
                 "what_is_stated": [],
                 "gaps": [],
                 "status": "empty",
             }
-            for layer in BICM_LAYERS
+            for layer in layer_specs
         ],
         "risk_map": {"critical_gaps": [], "interpretation_risks": [], "clear_points": []},
         "maturity": {"level": "draft", "rationale": ""},
@@ -303,8 +442,8 @@ def _normalize_anchor(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
-def _ensure_llm_payload(obj: dict) -> dict:
-    tpl = make_llm_template()
+def _ensure_llm_payload(obj: dict, layer_specs: list[dict]) -> dict:
+    tpl = make_llm_template(layer_specs)
     out = {"layers": []}
 
     layers_in = obj.get("layers") if isinstance(obj, dict) else []
@@ -315,12 +454,15 @@ def _ensure_llm_payload(obj: dict) -> dict:
     for item in layers_in:
         if not isinstance(item, dict):
             continue
-        layer_name = str(item.get("layer", "")).strip().upper()
-        if layer_name:
-            layer_map[layer_name] = item
+        layer_id = str(item.get("layer_id") or item.get("layer") or "").strip()
+        layer_title = str(item.get("layer_title") or "").strip()
+        key = _normalize_layer_id(layer_id) if layer_id else _normalize_layer_id(layer_title)
+        if key:
+            layer_map[key] = item
 
-    for layer_name in BICM_LAYERS:
-        item = layer_map.get(layer_name, {})
+    for layer in layer_specs:
+        expected_id = _normalize_layer_id(layer.get("layer_id", ""))
+        item = layer_map.get(expected_id, {})
         what_is_stated = item.get("what_is_stated", [])
         gaps = item.get("gaps", [])
 
@@ -356,7 +498,8 @@ def _ensure_llm_payload(obj: dict) -> dict:
 
         out["layers"].append(
             {
-                "layer": layer_name,
+                "layer_id": layer.get("layer_id"),
+                "layer_title": layer.get("layer_title"),
                 "what_is_stated": normalized_items,
                 "gaps": gaps,
             }
@@ -383,7 +526,7 @@ def _build_risk_map(layers: list[dict]) -> dict:
     clear = []
     for layer in layers:
         status = layer.get("status")
-        name = _ru_layer_path(layer.get("layer", ""))
+        name = (layer.get("layer_title") or layer.get("layer_id") or "").strip()
         if status == "empty":
             critical.append(name)
         elif status == "partial":
@@ -403,8 +546,8 @@ def _derive_maturity(layers: list[dict]) -> dict:
     return {"level": "contract_ready", "rationale": "Контрактные слои заполнены."}
 
 
-def build_bicm_report(llm_payload: dict, meta: dict) -> dict:
-    tpl = make_bicm_template()
+def build_bicm_report(llm_payload: dict, meta: dict, layer_specs: list[dict]) -> dict:
+    tpl = make_bicm_template(layer_specs)
     out = {
         "meta": dict(tpl["meta"]),
         "layers": [],
@@ -419,12 +562,15 @@ def build_bicm_report(llm_payload: dict, meta: dict) -> dict:
     for item in layers_in:
         if not isinstance(item, dict):
             continue
-        layer_name = str(item.get("layer", "")).strip().upper()
-        if layer_name:
-            layer_map[layer_name] = item
+        layer_id = str(item.get("layer_id") or item.get("layer") or "").strip()
+        layer_title = str(item.get("layer_title") or "").strip()
+        key = _normalize_layer_id(layer_id) if layer_id else _normalize_layer_id(layer_title)
+        if key:
+            layer_map[key] = item
 
-    for layer_name in BICM_LAYERS:
-        item = layer_map.get(layer_name, {})
+    for layer in layer_specs:
+        expected_id = _normalize_layer_id(layer.get("layer_id", ""))
+        item = layer_map.get(expected_id, {})
         what_is_stated = item.get("what_is_stated", []) or []
         gaps = item.get("gaps", []) or []
         if not isinstance(what_is_stated, list):
@@ -434,7 +580,8 @@ def build_bicm_report(llm_payload: dict, meta: dict) -> dict:
         status = _derive_layer_status(what_is_stated)
         out["layers"].append(
             {
-                "layer": layer_name,
+                "layer_id": layer.get("layer_id"),
+                "layer_title": layer.get("layer_title"),
                 "status": status,
                 "what_is_stated": what_is_stated,
                 "gaps": gaps,
@@ -462,9 +609,11 @@ def extract_json_strict(text: str) -> dict:
     return json.loads(m.group(0))
 
 
-def build_instruction(tone: str) -> str:
-    tpl = json.dumps(make_llm_template(), ensure_ascii=False, indent=2)
-    layers_text = "\n".join([f"- {layer}" for layer in BICM_LAYERS])
+def build_instruction(tone: str, layer_specs: list[dict]) -> str:
+    tpl = json.dumps(make_llm_template(layer_specs), ensure_ascii=False, indent=2)
+    layers_text = "\n".join(
+        [f"- {layer['layer_id']}: {layer['layer_title']}" for layer in layer_specs]
+    )
     return (
         "Ты — старший методолог и редактор. Получаешь обезличенный SAFE-бриф.\n"
         "Задача: извлечь ТОЛЬКО смыслы для контрактного отчёта (без оценок).\n"
@@ -476,7 +625,7 @@ def build_instruction(tone: str) -> str:
         "   Если встречается — замени токенами BRAND_#, DOMAIN_#, PERSON_#, GEO_#.\n"
         "5) Для каждого слоя: что сказано (text) + короткий anchor (цитата от пяти до двадцати пяти слов).\n"
         "6) Если данных по слою нет — what_is_stated пустой список. gaps может быть пустым.\n"
-        "7) Слои строго в таком порядке:\n"
+        "7) Слои строго в таком порядке (layer_id: layer_title):\n"
         f"{layers_text}\n"
         "8) Тон: " + (tone or "деловой, чёткий, без лишних слов") + "\n"
         "Верни РОВНО один JSON-объект без пояснений, без обёрток, без markdown.\n"
@@ -488,8 +637,8 @@ def build_instruction(tone: str) -> str:
 # -----------------------------
 # OpenAI call (multi-SDK)
 # -----------------------------
-def call_llm_to_json(api_key: str, model: str, payload: dict, tone: str) -> dict:
-    instruction = build_instruction(tone)
+def call_llm_to_json(api_key: str, model: str, payload: dict, tone: str, layer_specs: list[dict]) -> dict:
+    instruction = build_instruction(tone, layer_specs)
 
     user_obj = {
         "source_file": payload["source_file"],
@@ -515,7 +664,7 @@ def call_llm_to_json(api_key: str, model: str, payload: dict, tone: str) -> dict
             out_text = getattr(resp, "output_text", None)
             if not out_text:
                 out_text = json.dumps(resp.model_dump(), ensure_ascii=False)
-            return _ensure_llm_payload(extract_json_strict(out_text))
+            return _ensure_llm_payload(extract_json_strict(out_text), layer_specs)
 
         except TypeError:
             # response_format not supported
@@ -529,7 +678,7 @@ def call_llm_to_json(api_key: str, model: str, payload: dict, tone: str) -> dict
             out_text = getattr(resp, "output_text", None)
             if not out_text:
                 out_text = json.dumps(resp.model_dump(), ensure_ascii=False)
-            return _ensure_llm_payload(extract_json_strict(out_text))
+            return _ensure_llm_payload(extract_json_strict(out_text), layer_specs)
 
         except Exception:
             # fall through to legacy if possible
@@ -551,7 +700,7 @@ def call_llm_to_json(api_key: str, model: str, payload: dict, tone: str) -> dict
             temperature=0.2,
         )
         text = resp["choices"][0]["message"]["content"]
-        return _ensure_llm_payload(extract_json_strict(text))
+        return _ensure_llm_payload(extract_json_strict(text), layer_specs)
     except AttributeError:
         raise RuntimeError("Your openai package is too old/odd. Upgrade: pip install -U openai")
 
@@ -581,10 +730,6 @@ def _status_label(status: str) -> str:
 
 def _maturity_label(level: str) -> str:
     return MATURITY_TO_LABEL.get(level, "🟥 Draft")
-
-
-def _ru_layer_path(layer_name: str) -> str:
-    return RU_LAYER_PATHS.get((layer_name or "").strip().upper(), (layer_name or "").strip())
 
 
 def _layer_comment(layer: dict) -> str:
@@ -627,19 +772,19 @@ def render_docx(out_path: str, doc_json: dict, meta: dict):
     add_heading(doc, "2. Карта контрактных слоёв", level=1)
     table = doc.add_table(rows=1, cols=3)
     hdr_cells = table.rows[0].cells
-    hdr_cells[0].text = "Слой (RU path)"
+    hdr_cells[0].text = "Слой"
     hdr_cells[1].text = "Статус"
     hdr_cells[2].text = "Комментарий"
 
     for layer in doc_json.get("layers", []):
         row_cells = table.add_row().cells
-        row_cells[0].text = _ru_layer_path(layer.get("layer", ""))
+        row_cells[0].text = layer.get("layer_title") or layer.get("layer_id", "")
         row_cells[1].text = _status_label(layer.get("status", "empty"))
         row_cells[2].text = _layer_comment(layer)
 
     add_heading(doc, "3. Расшифровка по слоям", level=1)
     for layer in doc_json.get("layers", []):
-        layer_name = _ru_layer_path(layer.get("layer", ""))
+        layer_name = layer.get("layer_title") or layer.get("layer_id", "")
         add_heading(doc, f"СЛОЙ: {layer_name}", level=2)
         add_paragraph(doc, f"Статус: {_status_label(layer.get('status', 'empty'))}")
 
@@ -690,12 +835,14 @@ class BriefInterpretatorGUI(tk.Tk):
         self.geometry("1180x780")
 
         self.input_path = tk.StringVar(value="")
+        self.structure_path = tk.StringVar(value="")
         self.api_key = tk.StringVar(value="")
         self.model = tk.StringVar(value="gpt-5.2")
         self.tone = tk.StringVar(value="деловой, чёткий, без лишних слов")
 
         self.payload = None
         self.generated_json = None
+        self.layer_specs = build_layer_specs(DEFAULT_LAYER_TITLES)
 
         self._build_ui()
         self._load_saved_key()
@@ -710,22 +857,29 @@ class BriefInterpretatorGUI(tk.Tk):
         ttk.Entry(box, textvariable=self.input_path, width=92, state="readonly").grid(row=0, column=1, sticky="we", padx=8, pady=6)
         ttk.Button(box, text="Choose…", command=self.pick_file).grid(row=0, column=2, padx=8, pady=6)
 
-        ttk.Label(box, text="OpenAI API key:").grid(row=1, column=0, sticky="w", padx=8, pady=6)
-        ttk.Entry(box, textvariable=self.api_key, width=70, show="•").grid(row=1, column=1, sticky="w", padx=8, pady=6)
-        self.btn_save_key = ttk.Button(box, text="Save key", command=self.save_key)
-        self.btn_save_key.grid(row=1, column=2, padx=6, pady=6)
+        ttk.Label(box, text="Structure file (.docx):").grid(row=1, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(box, textvariable=self.structure_path, width=92, state="readonly").grid(
+            row=1, column=1, sticky="we", padx=8, pady=6
+        )
+        ttk.Button(box, text="Choose…", command=self.pick_structure).grid(row=1, column=2, padx=8, pady=6)
+        ttk.Button(box, text="Preview structure", command=self.preview_structure).grid(row=1, column=3, padx=8, pady=6)
 
-        ttk.Label(box, text="Model:").grid(row=1, column=3, sticky="e", padx=8, pady=6)
+        ttk.Label(box, text="OpenAI API key:").grid(row=2, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(box, textvariable=self.api_key, width=70, show="•").grid(row=2, column=1, sticky="w", padx=8, pady=6)
+        self.btn_save_key = ttk.Button(box, text="Save key", command=self.save_key)
+        self.btn_save_key.grid(row=2, column=2, padx=6, pady=6)
+
+        ttk.Label(box, text="Model:").grid(row=2, column=3, sticky="e", padx=8, pady=6)
         ttk.Combobox(
             box,
             textvariable=self.model,
             state="readonly",
             width=18,
             values=["gpt-5.2", "gpt-5-mini", "gpt-4.1", "gpt-4o", "gpt-4o-mini"],
-        ).grid(row=1, column=4, sticky="w", padx=8, pady=6)
+        ).grid(row=2, column=4, sticky="w", padx=8, pady=6)
 
-        ttk.Label(box, text="Tone (RU):").grid(row=2, column=0, sticky="w", padx=8, pady=6)
-        ttk.Entry(box, textvariable=self.tone, width=92).grid(row=2, column=1, columnspan=3, sticky="we", padx=8, pady=6)
+        ttk.Label(box, text="Tone (RU):").grid(row=3, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(box, textvariable=self.tone, width=92).grid(row=3, column=1, columnspan=3, sticky="we", padx=8, pady=6)
 
         box.columnconfigure(1, weight=1)
 
@@ -745,13 +899,16 @@ class BriefInterpretatorGUI(tk.Tk):
 
         self.txt_in = tk.Text(out, wrap="word")
         self.txt_json = tk.Text(out, wrap="none")
+        self.txt_structure = tk.Text(out, wrap="word")
         self.txt_log = tk.Text(out, wrap="word")
 
         out.add(self.txt_in, text="Input preview (SAFE)")
+        out.add(self.txt_structure, text="Structure")
         out.add(self.txt_json, text="Generated JSON")
         out.add(self.txt_log, text="Log")
 
         self._set_text(self.txt_in, "Choose a SAFE brief file to preview.")
+        self._set_text(self.txt_structure, "Structure preview will appear here.")
         self._set_text(self.txt_json, "")
         self._set_text(self.txt_log, "")
 
@@ -815,6 +972,68 @@ class BriefInterpretatorGUI(tk.Tk):
         self._set_text(self.txt_log, "")
         self.log(f"[OK] Selected: {path}")
 
+    def pick_structure(self):
+        path = filedialog.askopenfilename(
+            title="Choose structure file",
+            filetypes=[
+                ("All files", "*.*"),
+                ("Word documents", "*.docx"),
+            ],
+        )
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in (".docx",):
+            messagebox.showinfo("Unsupported file", "Unsupported file type. Please select .docx")
+            self.log(f"[WARN] Unsupported structure file type selected: {path}")
+            return
+        self.structure_path.set(path)
+        self.status.config(text="Structure selected.")
+        self.generated_json = None
+        self._set_text(self.txt_json, "")
+        self.log(f"[STRUCTURE] Selected: {path}")
+        self._load_structure()
+
+    def _load_structure(self):
+        if not self.structure_path.get():
+            self.layer_specs = build_layer_specs(DEFAULT_LAYER_TITLES)
+            self.log("[WARN] No structure file selected. Using DEFAULT structure.")
+            self.log(f"[STRUCTURE] Layers recognized: {len(self.layer_specs)}")
+            self.log(
+                "[STRUCTURE] First layers: "
+                + ", ".join([layer["layer_title"] for layer in self.layer_specs[:3]])
+            )
+            self._preview_structure(self.layer_specs, fallback=True)
+            return
+        parsed = parse_structure_docx(self.structure_path.get())
+        if not parsed:
+            self.layer_specs = build_layer_specs(DEFAULT_LAYER_TITLES)
+            self.log("[WARN] Structure not recognized. Falling back to DEFAULT structure.")
+            self.log(f"[STRUCTURE] Layers recognized: {len(self.layer_specs)}")
+            self.log(
+                "[STRUCTURE] First layers: "
+                + ", ".join([layer["layer_title"] for layer in self.layer_specs[:3]])
+            )
+            self._preview_structure(self.layer_specs, fallback=True)
+            return
+        self.layer_specs = build_layer_specs(parsed)
+        self.log(f"[STRUCTURE] Layers recognized: {len(self.layer_specs)}")
+        self.log(
+            "[STRUCTURE] First layers: "
+            + ", ".join([layer["layer_title"] for layer in self.layer_specs[:3]])
+        )
+        self._preview_structure(self.layer_specs, fallback=False)
+
+    def _preview_structure(self, layer_specs: list[dict], fallback: bool):
+        lines = []
+        for idx, layer in enumerate(layer_specs, start=1):
+            lines.append(f"{idx}. {layer['layer_title']} ({layer['layer_id']})")
+        content = "\n".join(lines) if lines else "No layers recognized."
+        self._set_text(self.txt_structure, content)
+
+    def preview_structure(self):
+        self._load_structure()
+
     def preview_input(self):
         if not self.input_path.get():
             messagebox.showinfo("No file", "Choose a SAFE brief file first.")
@@ -854,6 +1073,8 @@ class BriefInterpretatorGUI(tk.Tk):
         self._set_text(self.txt_log, "")
 
         try:
+            if not self.layer_specs:
+                self._load_structure()
             meta = {
                 "source_file": os.path.basename(self.input_path.get()),
                 "source_type": self._detect_source_type(),
@@ -866,9 +1087,10 @@ class BriefInterpretatorGUI(tk.Tk):
                 model=self.model.get().strip(),
                 payload=self.payload,
                 tone=self.tone.get().strip() or "деловой, чёткий, без лишних слов",
+                layer_specs=self.layer_specs,
             )
             self.log("[BICM] deterministic scoring")
-            doc_json = build_bicm_report(llm_payload, meta)
+            doc_json = build_bicm_report(llm_payload, meta, self.layer_specs)
             self.generated_json = doc_json
             self._set_text(self.txt_json, json.dumps(doc_json, ensure_ascii=False, indent=2))
             self.log("[OK] Generated JSON.")
